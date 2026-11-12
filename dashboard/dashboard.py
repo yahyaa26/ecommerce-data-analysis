@@ -1,9 +1,9 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 from pathlib import Path
-from datetime import timedelta
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -26,18 +26,6 @@ DATA_DIR = BASE_DIR.parent / "data"
 @st.cache_data
 def load_data():
 
-    monthly_sales = pd.read_csv(
-        BASE_DIR / "monthly_sales.csv"
-    )
-
-    delivery_data = pd.read_csv(
-        BASE_DIR / "delivery_by_state.csv"
-    )
-
-    rfm_data = pd.read_csv(
-        BASE_DIR / "rfm_summary.csv"
-    )
-
     orders = pd.read_csv(
         DATA_DIR / "orders_dataset.csv"
     )
@@ -50,17 +38,28 @@ def load_data():
         DATA_DIR / "order_items_dataset.csv"
     )
 
-    orders["order_purchase_timestamp"] = pd.to_datetime(
-        orders["order_purchase_timestamp"],
-        errors="coerce"
-    )
+    # Convert date columns
+    date_columns = [
+        "order_purchase_timestamp",
+        "order_approved_at",
+        "order_delivered_carrier_date",
+        "order_delivered_customer_date",
+        "order_estimated_delivery_date"
+    ]
 
-    # Hanya menggunakan pesanan delivered
+    for column in date_columns:
+        if column in orders.columns:
+            orders[column] = pd.to_datetime(
+                orders[column],
+                errors="coerce"
+            )
+
+    # Only delivered orders
     delivered_orders = orders[
         orders["order_status"] == "delivered"
     ].copy()
 
-    # Menggabungkan pesanan dengan pelanggan
+    # Merge customer information
     customer_orders = delivered_orders.merge(
         customers[
             ["customer_id", "customer_unique_id", "customer_state"]
@@ -69,7 +68,7 @@ def load_data():
         how="left"
     )
 
-    # Menggabungkan pesanan dengan order items
+    # Merge product prices
     sales_detail = delivered_orders.merge(
         order_items[["order_id", "price"]],
         on="order_id",
@@ -84,27 +83,16 @@ def load_data():
         how="left"
     )
 
+    # Monthly column
     sales_detail["order_month"] = (
         sales_detail["order_purchase_timestamp"]
         .dt.strftime("%Y-%m")
     )
 
-    return (
-        monthly_sales,
-        delivery_data,
-        rfm_data,
-        customer_orders,
-        sales_detail
-    )
+    return customer_orders, sales_detail
 
 
-(
-    monthly_sales,
-    delivery_data,
-    rfm_data,
-    customer_orders,
-    sales_detail
-) = load_data()
+customer_orders, sales_detail = load_data()
 
 
 # ==========================================
@@ -128,7 +116,7 @@ st.divider()
 
 st.sidebar.header("Dashboard Filters")
 
-# FILTER TANGGAL
+# DATE FILTER
 
 min_date = sales_detail[
     "order_purchase_timestamp"
@@ -156,14 +144,12 @@ if start_date > end_date:
     st.stop()
 
 
-# FILTER CUSTOMER STATE
-
-delivery_visual = delivery_data[
-    delivery_data["total_orders"] >= 100
-].copy()
+# STATE FILTER
 
 available_states = sorted(
-    delivery_visual["customer_state"].dropna().unique()
+    customer_orders["customer_state"]
+    .dropna()
+    .unique()
 )
 
 selected_states = st.sidebar.multiselect(
@@ -173,76 +159,70 @@ selected_states = st.sidebar.multiselect(
 )
 
 
-# FILTER DATA PENJUALAN BERDASARKAN TANGGAL
+# ==========================================
+# 5. APPLY GLOBAL FILTER
+# ==========================================
+
+# SALES FILTER
 
 filtered_sales_detail = sales_detail[
-    (
-        sales_detail["order_purchase_timestamp"].dt.date >= start_date
-    ) &
-    (
-        sales_detail["order_purchase_timestamp"].dt.date <= end_date
-    )
+    (sales_detail["order_purchase_timestamp"].dt.date >= start_date) &
+    (sales_detail["order_purchase_timestamp"].dt.date <= end_date) &
+    (sales_detail["customer_state"].isin(selected_states))
 ].copy()
 
 
-# FILTER DATA PELANGGAN BERDASARKAN TANGGAL DAN WILAYAH
+# CUSTOMER FILTER
 
 filtered_customer_orders = customer_orders[
-    (
-        customer_orders["order_purchase_timestamp"].dt.date >= start_date
-    ) &
-    (
-        customer_orders["order_purchase_timestamp"].dt.date <= end_date
-    ) &
-    (
-        customer_orders["customer_state"].isin(selected_states)
-    )
+    (customer_orders["order_purchase_timestamp"].dt.date >= start_date) &
+    (customer_orders["order_purchase_timestamp"].dt.date <= end_date) &
+    (customer_orders["customer_state"].isin(selected_states))
 ].copy()
 
 
-# FILTER DATA PENGIRIMAN BERDASARKAN WILAYAH
+# DELIVERY FILTER
 
-filtered_delivery = delivery_visual[
-    delivery_visual["customer_state"].isin(selected_states)
-].copy()
+filtered_delivery = filtered_customer_orders.copy()
 
+# Calculate delivery duration
+filtered_delivery["delivery_duration"] = (
+    filtered_delivery["order_delivered_customer_date"] -
+    filtered_delivery["order_purchase_timestamp"]
+).dt.total_seconds() / 86400
 
-# AGREGASI PENJUALAN BULANAN BERDASARKAN FILTER TANGGAL
+# Calculate delivery delay
+filtered_delivery["delay_days"] = (
+    filtered_delivery["order_delivered_customer_date"] -
+    filtered_delivery["order_estimated_delivery_date"]
+).dt.total_seconds() / 86400
 
-filtered_sales = (
-    filtered_sales_detail
-    .groupby("order_month")
-    .agg(
-        total_orders=("order_id", "nunique"),
-        total_sales=("price", "sum")
-    )
-    .reset_index()
+filtered_delivery["is_late"] = (
+    filtered_delivery["delay_days"] > 0
 )
 
 
 # ==========================================
-# 5. DYNAMIC KPI
+# 6. DYNAMIC KPI
 # ==========================================
-
-# KPI PENJUALAN
 
 total_sales = filtered_sales_detail["price"].sum()
 
-total_orders = filtered_sales_detail["order_id"].nunique()
-
-
-# KPI PELANGGAN
+total_orders = (
+    filtered_sales_detail["order_id"].nunique()
+)
 
 total_customers = (
     filtered_customer_orders["customer_unique_id"].nunique()
 )
 
+total_late_orders = (
+    filtered_delivery["is_late"].sum()
+)
 
-# KPI PENGIRIMAN
-
-total_late_orders = filtered_delivery["late_orders"].sum()
-
-total_delivery_orders = filtered_delivery["total_orders"].sum()
+total_delivery_orders = (
+    filtered_delivery["order_id"].nunique()
+)
 
 late_percentage = (
     total_late_orders / total_delivery_orders * 100
@@ -252,7 +232,7 @@ late_percentage = (
 
 
 # ==========================================
-# 6. DISPLAY KPI
+# 7. DISPLAY KPI
 # ==========================================
 
 st.header("📊 Business Performance Overview")
@@ -288,7 +268,7 @@ st.divider()
 
 
 # ==========================================
-# 7. MONTHLY SALES PERFORMANCE
+# 8. MONTHLY SALES PERFORMANCE
 # ==========================================
 
 st.header("📈 Monthly Sales Performance")
@@ -298,30 +278,46 @@ Visualisasi perkembangan jumlah pesanan dan total nilai
 penjualan produk secara bulanan pada E-Commerce Olist.
 """)
 
+filtered_sales = (
+    filtered_sales_detail
+    .groupby("order_month")
+    .agg(
+        total_orders=("order_id", "nunique"),
+        total_sales=("price", "sum")
+    )
+    .reset_index()
+    .sort_values("order_month")
+)
+
 if not filtered_sales.empty:
 
     fig_sales = px.bar(
         filtered_sales,
         x="order_month",
         y="total_sales",
+        text="total_sales",
+        title="Monthly Product Sales Value",
         labels={
             "order_month": "Month",
             "total_sales": "Sales Value (BRL)"
-        },
-        title="Monthly Product Sales Value",
-        text_auto=".2s"
+        }
+    )
+
+    fig_sales.update_traces(
+        texttemplate="BRL %{text:,.0f}",
+        textposition="outside"
     )
 
     fig_sales.update_layout(
+        template="plotly_white",
         xaxis_title="Month",
         yaxis_title="Sales Value (BRL)",
-        template="plotly_white",
-        hovermode="x unified"
+        xaxis_type="category"
     )
 
     st.plotly_chart(
         fig_sales,
-        use_container_width=True
+        width="stretch"
     )
 
     fig_orders = px.line(
@@ -329,33 +325,31 @@ if not filtered_sales.empty:
         x="order_month",
         y="total_orders",
         markers=True,
+        title="Monthly Delivered Orders",
         labels={
             "order_month": "Month",
             "total_orders": "Number of Orders"
-        },
-        title="Monthly Delivered Orders"
+        }
     )
 
     fig_orders.update_layout(
+        template="plotly_white",
         xaxis_title="Month",
         yaxis_title="Number of Orders",
-        template="plotly_white",
-        hovermode="x unified"
+        xaxis_type="category"
     )
 
     st.plotly_chart(
         fig_orders,
-        use_container_width=True
+        width="stretch"
     )
 
 else:
-    st.warning(
-        "Tidak terdapat data penjualan pada rentang tanggal yang dipilih."
-    )
+    st.info("Tidak terdapat data penjualan pada filter yang dipilih.")
 
 
 # ==========================================
-# 8. DELIVERY PERFORMANCE
+# 9. DELIVERY PERFORMANCE
 # ==========================================
 
 st.divider()
@@ -364,23 +358,48 @@ st.header("🚚 Delivery Performance by State")
 
 st.markdown("""
 Analisis performa pengiriman berdasarkan negara bagian
-pelanggan di Brasil untuk mengidentifikasi wilayah
-dengan tingkat keterlambatan pengiriman tertinggi.
+pelanggan di Brasil.
 """)
 
 if not filtered_delivery.empty:
 
-    top_delay_rate = (
+    delivery_summary = (
         filtered_delivery
+        .groupby("customer_state")
+        .agg(
+            total_orders=("order_id", "nunique"),
+            late_orders=("is_late", "sum"),
+            avg_delivery_duration=("delivery_duration", "mean"),
+            avg_delay_days=(
+                "delay_days",
+                lambda x: x[x > 0].mean()
+            )
+        )
+        .reset_index()
+    )
+
+    delivery_summary["late_percentage"] = (
+        delivery_summary["late_orders"] /
+        delivery_summary["total_orders"] * 100
+    )
+
+    delivery_summary["avg_delay_days"] = (
+        delivery_summary["avg_delay_days"].fillna(0)
+    )
+
+    # Delivery delay rate
+    top_delay_rate = (
+        delivery_summary
         .sort_values(
-            by="late_percentage",
+            "late_percentage",
             ascending=False
         )
         .head(10)
+        .sort_values("late_percentage")
     )
 
     fig_delay_rate = px.bar(
-        top_delay_rate.sort_values("late_percentage"),
+        top_delay_rate,
         x="late_percentage",
         y="customer_state",
         orientation="h",
@@ -405,58 +424,57 @@ if not filtered_delivery.empty:
 
     st.plotly_chart(
         fig_delay_rate,
-        use_container_width=True
+        width="stretch"
     )
 
+    # Average delivery delay
     top_avg_delay = (
-        filtered_delivery
-        .dropna(subset=["avg_delay_days"])
+        delivery_summary
         .sort_values(
-            by="avg_delay_days",
+            "avg_delay_days",
             ascending=False
         )
         .head(10)
+        .sort_values("avg_delay_days")
     )
 
-    if not top_avg_delay.empty:
+    fig_avg_delay = px.bar(
+        top_avg_delay,
+        x="avg_delay_days",
+        y="customer_state",
+        orientation="h",
+        text="avg_delay_days",
+        title="Top 10 States with Highest Average Delivery Delay",
+        labels={
+            "avg_delay_days": "Average Delay (Days)",
+            "customer_state": "Customer State"
+        }
+    )
 
-        fig_avg_delay = px.bar(
-            top_avg_delay.sort_values("avg_delay_days"),
-            x="avg_delay_days",
-            y="customer_state",
-            orientation="h",
-            text="avg_delay_days",
-            title="Top 10 States with Highest Average Delivery Delay",
-            labels={
-                "avg_delay_days": "Average Delay (Days)",
-                "customer_state": "Customer State"
-            }
-        )
+    fig_avg_delay.update_traces(
+        texttemplate="%{text:.2f} days",
+        textposition="outside"
+    )
 
-        fig_avg_delay.update_traces(
-            texttemplate="%{text:.2f} days",
-            textposition="outside"
-        )
+    fig_avg_delay.update_layout(
+        template="plotly_white",
+        xaxis_title="Average Delay (Days)",
+        yaxis_title="Customer State"
+    )
 
-        fig_avg_delay.update_layout(
-            template="plotly_white",
-            xaxis_title="Average Delivery Delay (Days)",
-            yaxis_title="Customer State"
-        )
-
-        st.plotly_chart(
-            fig_avg_delay,
-            use_container_width=True
-        )
+    st.plotly_chart(
+        fig_avg_delay,
+        width="stretch"
+    )
 
 else:
-    st.warning(
-        "Tidak terdapat data pengiriman pada wilayah yang dipilih."
-    )
+    delivery_summary = pd.DataFrame()
+
+    st.info("Tidak terdapat data pengiriman pada filter yang dipilih.")
 
 
 # ==========================================
-# 9. CUSTOMER SEGMENTATION (RFM ANALYSIS)
+# 10. CUSTOMER SEGMENTATION (RFM ANALYSIS)
 # ==========================================
 
 st.divider()
@@ -465,125 +483,233 @@ st.header("👥 Customer Segmentation (RFM Analysis)")
 
 st.markdown("""
 Analisis segmentasi pelanggan menggunakan metode
-Recency, Frequency, dan Monetary (RFM) untuk memahami
-perilaku pembelian dan kontribusi nilai pelanggan.
+Recency, Frequency, dan Monetary (RFM) berdasarkan
+transaksi dalam periode dan wilayah yang dipilih.
 """)
 
-rfm_visual = rfm_data.sort_values(
-    by="Total_Customers",
-    ascending=False
-)
+if not filtered_sales_detail.empty:
 
+    # Aggregate customer metrics (same calculation as notebook Cell 62)
+    customer_rfm = (
+        filtered_sales_detail
+        .groupby("customer_unique_id")
+        .agg(
+            last_purchase=("order_purchase_timestamp", "max"),
+            Frequency=("order_id", "nunique"),
+            Monetary=("price", "sum")
+        )
+        .reset_index()
+    )
 
-# CUSTOMER DISTRIBUTION
+    # Reference date based on the latest transaction in the filtered data
+    reference_date = (
+        filtered_sales_detail["order_purchase_timestamp"].max()
+        + pd.Timedelta(days=1)
+    )
 
-fig_segment = px.bar(
-    rfm_visual.sort_values("Total_Customers"),
-    x="Total_Customers",
-    y="Customer_Segment",
-    orientation="h",
-    text="Total_Customers",
-    title="Customer Distribution by Segment",
-    labels={
-        "Total_Customers": "Number of Customers",
-        "Customer_Segment": "Customer Segment"
-    }
-)
+    customer_rfm["Recency"] = (
+        reference_date - customer_rfm["last_purchase"]
+    ).dt.days
 
-fig_segment.update_traces(
-    texttemplate="%{text:,.0f}",
-    textposition="outside"
-)
+    # RFM scoring: exactly follow notebook Cell 63
+    # R Score: lower Recency receives a higher score
+    customer_rfm["R_Score"] = np.ceil(
+        (1 - customer_rfm["Recency"].rank(
+            method="average",
+            pct=True
+        )) * 5
+    ).clip(1, 5).astype(int)
 
-fig_segment.update_layout(
-    template="plotly_white",
-    yaxis_title="Customer Segment",
-    xaxis_title="Number of Customers"
-)
+    # F Score: customers with the same order frequency receive the same score
+    customer_rfm["F_Score"] = pd.cut(
+        customer_rfm["Frequency"],
+        bins=[0, 1, 2, 3, 5, np.inf],
+        labels=[1, 2, 3, 4, 5]
+    ).astype(int)
 
-st.plotly_chart(
-    fig_segment,
-    use_container_width=True
-)
+    # M Score: higher Monetary receives a higher score
+    customer_rfm["M_Score"] = np.ceil(
+        customer_rfm["Monetary"].rank(
+            method="average",
+            pct=True
+        ) * 5
+    ).clip(1, 5).astype(int)
 
+    # Combine R, F, and M scores
+    customer_rfm["RFM_Score"] = (
+        customer_rfm["R_Score"].astype(str) +
+        customer_rfm["F_Score"].astype(str) +
+        customer_rfm["M_Score"].astype(str)
+    )
 
-# TOTAL MONETARY
+    # Customer segmentation: exactly follow notebook Cell 64
+    conditions = [
+        (
+            (customer_rfm["R_Score"] >= 4) &
+            (customer_rfm["F_Score"] >= 3) &
+            (customer_rfm["M_Score"] >= 4)
+        ),
+        (
+            (customer_rfm["R_Score"] >= 3) &
+            (customer_rfm["F_Score"] >= 3) &
+            (customer_rfm["M_Score"] >= 3)
+        ),
+        (
+            (customer_rfm["R_Score"] <= 2) &
+            (customer_rfm["F_Score"] >= 3)
+        ),
+        (
+            (customer_rfm["R_Score"] >= 4) &
+            (customer_rfm["F_Score"] <= 2) &
+            (customer_rfm["M_Score"] >= 3)
+        ),
+        (
+            (customer_rfm["R_Score"] >= 4) &
+            (customer_rfm["F_Score"] == 1) &
+            (customer_rfm["M_Score"] < 3)
+        )
+    ]
 
-fig_monetary = px.bar(
-    rfm_visual.sort_values("Total_Monetary"),
-    x="Total_Monetary",
-    y="Customer_Segment",
-    orientation="h",
-    text="Total_Monetary",
-    title="Total Purchase Value by Customer Segment",
-    labels={
-        "Total_Monetary": "Total Monetary (BRL)",
-        "Customer_Segment": "Customer Segment"
-    }
-)
+    segment_names = [
+        "Champions",
+        "Loyal Customers",
+        "At Risk",
+        "Potential Loyalists",
+        "Recent Customers"
+    ]
 
-fig_monetary.update_traces(
-    texttemplate="BRL %{text:,.0f}",
-    textposition="outside"
-)
+    customer_rfm["Customer_Segment"] = np.select(
+        conditions,
+        segment_names,
+        default="Others"
+    )
 
-fig_monetary.update_layout(
-    template="plotly_white",
-    yaxis_title="Customer Segment",
-    xaxis_title="Total Monetary (BRL)"
-)
+    # Segment summary
+    rfm_summary = (
+        customer_rfm
+        .groupby("Customer_Segment", observed=False)
+        .agg(
+            Total_Customers=("customer_unique_id", "nunique"),
+            Avg_Recency=("Recency", "mean"),
+            Avg_Frequency=("Frequency", "mean"),
+            Avg_Monetary=("Monetary", "mean"),
+            Total_Monetary=("Monetary", "sum")
+        )
+        .reset_index()
+    )
 
-st.plotly_chart(
-    fig_monetary,
-    use_container_width=True
-)
+    rfm_summary["Customer_Percentage"] = (
+        rfm_summary["Total_Customers"] /
+        rfm_summary["Total_Customers"].sum() * 100
+    )
 
+    rfm_visual = rfm_summary.sort_values(
+        "Total_Customers",
+        ascending=False
+    )
 
-# AVERAGE MONETARY
+    # Customer distribution
+    fig_segment = px.bar(
+        rfm_visual.sort_values("Total_Customers"),
+        x="Total_Customers",
+        y="Customer_Segment",
+        orientation="h",
+        text="Total_Customers",
+        title="Customer Distribution by Segment",
+        labels={
+            "Total_Customers": "Number of Customers",
+            "Customer_Segment": "Customer Segment"
+        }
+    )
 
-fig_avg_monetary = px.bar(
-    rfm_visual.sort_values("Avg_Monetary"),
-    x="Avg_Monetary",
-    y="Customer_Segment",
-    orientation="h",
-    text="Avg_Monetary",
-    title="Average Purchase Value per Customer",
-    labels={
-        "Avg_Monetary": "Average Monetary (BRL)",
-        "Customer_Segment": "Customer Segment"
-    }
-)
+    fig_segment.update_traces(
+        texttemplate="%{text:,.0f}",
+        textposition="outside"
+    )
 
-fig_avg_monetary.update_traces(
-    texttemplate="BRL %{text:,.2f}",
-    textposition="outside"
-)
+    fig_segment.update_layout(
+        template="plotly_white"
+    )
 
-fig_avg_monetary.update_layout(
-    template="plotly_white",
-    yaxis_title="Customer Segment",
-    xaxis_title="Average Monetary (BRL)"
-)
+    st.plotly_chart(
+        fig_segment,
+        width="stretch"
+    )
 
-st.plotly_chart(
-    fig_avg_monetary,
-    use_container_width=True
-)
+    # Total monetary
+    fig_monetary = px.bar(
+        rfm_visual.sort_values("Total_Monetary"),
+        x="Total_Monetary",
+        y="Customer_Segment",
+        orientation="h",
+        text="Total_Monetary",
+        title="Total Purchase Value by Customer Segment",
+        labels={
+            "Total_Monetary": "Total Monetary (BRL)",
+            "Customer_Segment": "Customer Segment"
+        }
+    )
 
+    fig_monetary.update_traces(
+        texttemplate="BRL %{text:,.0f}",
+        textposition="outside"
+    )
 
-# RFM SUMMARY TABLE
+    fig_monetary.update_layout(
+        template="plotly_white"
+    )
 
-st.subheader("RFM Segment Summary")
+    st.plotly_chart(
+        fig_monetary,
+        width="stretch"
+    )
 
-st.dataframe(
-    rfm_visual.round(2),
-    use_container_width=True,
-    hide_index=True
-)
+    # Average monetary
+    fig_avg_monetary = px.bar(
+        rfm_visual.sort_values("Avg_Monetary"),
+        x="Avg_Monetary",
+        y="Customer_Segment",
+        orientation="h",
+        text="Avg_Monetary",
+        title="Average Purchase Value per Customer",
+        labels={
+            "Avg_Monetary": "Average Monetary (BRL)",
+            "Customer_Segment": "Customer Segment"
+        }
+    )
+
+    fig_avg_monetary.update_traces(
+        texttemplate="BRL %{text:,.2f}",
+        textposition="outside"
+    )
+
+    fig_avg_monetary.update_layout(
+        template="plotly_white"
+    )
+
+    st.plotly_chart(
+        fig_avg_monetary,
+        width="stretch"
+    )
+
+    # RFM table
+    st.subheader("RFM Segment Summary")
+
+    st.dataframe(
+        rfm_visual.round(2),
+        width="stretch",
+        hide_index=True
+    )
+
+else:
+    customer_rfm = pd.DataFrame()
+    rfm_summary = pd.DataFrame()
+
+    st.info("Tidak terdapat data pelanggan pada filter yang dipilih.")
 
 
 # ==========================================
-# 10. KEY BUSINESS INSIGHTS
+# 11. KEY BUSINESS INSIGHTS
 # ==========================================
 
 st.divider()
@@ -591,71 +717,65 @@ st.divider()
 st.header("💡 Key Business Insights")
 
 st.markdown("""
-Ringkasan temuan utama berdasarkan hasil analisis
-penjualan, pengiriman, dan segmentasi pelanggan.
+Ringkasan temuan berdasarkan filter tanggal dan
+negara bagian yang dipilih.
 """)
 
 # SALES INSIGHT
 
-sales_with_transactions = monthly_sales[
-    monthly_sales["total_orders"] > 0
-]
+if not filtered_sales.empty:
 
-if not sales_with_transactions.empty:
-
-    highest_sales = sales_with_transactions.loc[
-        sales_with_transactions["total_sales"].idxmax()
+    highest_sales = filtered_sales.loc[
+        filtered_sales["total_sales"].idxmax()
     ]
 
-    lowest_sales = sales_with_transactions.loc[
-        sales_with_transactions["total_sales"].idxmin()
+    lowest_sales = filtered_sales.loc[
+        filtered_sales["total_sales"].idxmin()
     ]
 
     col1, col2 = st.columns(2)
 
     with col1:
 
-        st.subheader("📈 Sales Performance")
+        st.subheader("📈 Highest Sales")
 
         st.metric(
             "Highest Sales Month",
-            str(highest_sales["order_month"])
+            highest_sales["order_month"]
         )
 
         st.write(
-            f"Total sales reached "
-            f"**BRL {highest_sales['total_sales']:,.2f}** "
+            f"Total sales: **BRL {highest_sales['total_sales']:,.2f}** "
             f"with **{highest_sales['total_orders']:,.0f} orders**."
         )
 
     with col2:
 
-        st.subheader("📉 Lowest Sales Month")
+        st.subheader("📉 Lowest Sales")
 
         st.metric(
             "Lowest Sales Month",
-            str(lowest_sales["order_month"])
+            lowest_sales["order_month"]
         )
 
         st.write(
-            f"Total sales were "
-            f"**BRL {lowest_sales['total_sales']:,.2f}** "
+            f"Total sales: **BRL {lowest_sales['total_sales']:,.2f}** "
             f"with **{lowest_sales['total_orders']:,.0f} orders**."
         )
 
 
 # DELIVERY INSIGHT
 
-if not delivery_data.empty:
+if not delivery_summary.empty:
 
-    highest_delay = delivery_data.loc[
-        delivery_data["late_percentage"].idxmax()
+    highest_delay = delivery_summary.loc[
+        delivery_summary["late_percentage"].idxmax()
     ]
 
     st.subheader("🚚 Delivery Performance")
 
     st.metric(
-        "Highest Delay Rate",
+        "Highest Delivery Delay Rate",
         f"{highest_delay['late_percentage']:.2f}%"
     )
 
@@ -668,14 +788,14 @@ if not delivery_data.empty:
 
 # CUSTOMER INSIGHT
 
-if not rfm_data.empty:
+if not rfm_summary.empty:
 
-    largest_segment = rfm_data.loc[
-        rfm_data["Total_Customers"].idxmax()
+    largest_segment = rfm_summary.loc[
+        rfm_summary["Total_Customers"].idxmax()
     ]
 
-    highest_avg_monetary = rfm_data.loc[
-        rfm_data["Avg_Monetary"].idxmax()
+    highest_avg_monetary = rfm_summary.loc[
+        rfm_summary["Avg_Monetary"].idxmax()
     ]
 
     col3, col4 = st.columns(2)
@@ -694,7 +814,7 @@ if not rfm_data.empty:
             f"**{largest_segment['Total_Customers']:,.0f} customers**, "
             f"representing "
             f"**{largest_segment['Customer_Percentage']:.2f}%** "
-            f"of all analyzed customers."
+            f"of filtered customers."
         )
 
     with col4:
@@ -714,7 +834,7 @@ if not rfm_data.empty:
 
 
 # ==========================================
-# END OF DASHBOARD
+# 12. FOOTER
 # ==========================================
 
 st.divider()
